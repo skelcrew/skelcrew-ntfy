@@ -1,0 +1,9 @@
+id = "skelcrew.ntfy"
+name = "ntfy notifier"
+version = "0.1.0"
+min_skelcrew_version = "0.0.1"
+description = "Sends a push to your phone or desktop, through ntfy, when a task needs you."
+
+[[hooks]]
+on = ["task.added", "task.asked", "task.approval", "task.held", "task.delivered", "task.ended"]
+command = ["bun", "notify.ts"]
