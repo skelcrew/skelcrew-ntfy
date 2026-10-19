@@ -95,8 +95,18 @@ function pushFor({ event, repo, sample, task }: HookEvent): Push {
       };
     case "task.delivered":
       return { title: titled("is delivered"), message: lines(task.title, task.result), priority: 3, tags: ["white_check_mark"] };
-    case "task.ended":
-      return { title: titled(`ended: ${task.ended ?? "unknown"}`), message: task.title, priority: 2, tags: ["x"] };
+    case "task.ended": {
+      // "declined: <reason>" keeps the reason, which an agent wrote and may
+      // be long, out of the title: ntfy refuses a title over 1,024 bytes.
+      const [how, ...why] = (task.ended ?? "unknown").split(": ");
+      const reason = why.length > 0 ? why.join(": ") : null;
+      return {
+        title: titled(`ended: ${how}`),
+        message: reason === null ? task.title : lines(reason, "", task.title),
+        priority: 2,
+        tags: ["x"],
+      };
+    }
     default:
       return { title: titled("added"), message: task.title, priority: 1, tags: ["new"] };
   }
@@ -120,18 +130,29 @@ async function send(settings: Settings, push: Push): Promise<void> {
     throw new Refused(`Couldn't reach ${settings.server}: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (!response.ok) {
-    const answer = (await response.text()).trim().slice(0, 500);
-    throw new Refused(`${settings.server} refused it with ${response.status}: ${answer}`);
+    // The answer may never finish, so a failed read still says who refused.
+    const answer = await response.text().then(
+      (text) => text.trim().slice(0, 500),
+      () => "",
+    );
+    throw new Refused(`${settings.server} refused it with ${response.status}${answer === "" ? "." : `: ${answer}`}`);
   }
   console.log("Sent.");
 }
 
-// The text cut to fit ntfy's limit, with "…" to show it was.
+// The text cut to fit ntfy's limit, with "…" to show it was. It is cut
+// between whole characters, so an emoji is never split into a broken one.
 function cut(text: string): string {
   const encoder = new TextEncoder();
   if (encoder.encode(text).length <= MESSAGE_BYTES) return text;
-  let kept = text.slice(0, MESSAGE_BYTES);
-  while (encoder.encode(`${kept}…`).length > MESSAGE_BYTES) kept = kept.slice(0, -1);
+  const room = MESSAGE_BYTES - encoder.encode("…").length;
+  let kept = "";
+  let bytes = 0;
+  for (const character of text) {
+    bytes += encoder.encode(character).length;
+    if (bytes > room) break;
+    kept += character;
+  }
   return `${kept}…`;
 }
 
@@ -191,8 +212,8 @@ function texts(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
 }
 
-// The settings from `.env`: one KEY=value a line, with # for a comment, and
-// the value in quotes if you like. An unknown key is refused, so a typo such
+// The settings from `.env`: one KEY=value a line, with # for a comment, on a
+// line of its own or after a space, and the value in quotes if you like. An unknown key is refused, so a typo such
 // as NTFY_TOKN never leaves the token out without a word.
 function readSettings(folder: string): Settings {
   const path = join(folder, ".env");
@@ -211,7 +232,7 @@ function readSettings(folder: string): Settings {
     if (!KEYS.includes(key)) {
       throw new Refused(`${path} line ${index + 1}: unknown key ${key}. Known keys: ${KEYS.join(", ")}.`);
     }
-    values.set(key, unquote(equals === -1 ? "" : trimmed.slice(equals + 1).trim()));
+    values.set(key, valueOf(equals === -1 ? "" : trimmed.slice(equals + 1).trim()));
   });
   const topic = values.get("NTFY_TOPIC") ?? "";
   if (topic === "") throw new Refused(`No ntfy topic. Write NTFY_TOPIC=<your topic> to ${path}.`);
@@ -232,12 +253,24 @@ function readSettings(folder: string): Settings {
   };
 }
 
-function unquote(value: string): string {
-  const quoted = value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0];
-  return quoted ? value.slice(1, -1) : value;
+// The value written after the `=`: what is inside quotes, or else what comes
+// before a ` #` comment. So `skel#phone` keeps its #, as other .env readers do.
+function valueOf(written: string): string {
+  const quote = written[0];
+  if (quote === '"' || quote === "'") {
+    const end = written.indexOf(quote, 1);
+    if (end !== -1) return written.slice(1, end);
+  }
+  return written.replace(/\s+#.*$/, "");
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Refused ? error.message : String(error));
-  process.exit(1);
-});
+// The hook exits the moment it is done. Otherwise an answer that never
+// finishes, or the time limit's timer, would keep it running, and the
+// plugin's next event waiting.
+main().then(
+  () => process.exit(0),
+  (error: unknown) => {
+    console.error(error instanceof Refused ? error.message : String(error));
+    process.exit(1);
+  },
+);

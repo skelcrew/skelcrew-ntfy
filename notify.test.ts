@@ -11,11 +11,14 @@ import { join } from "node:path";
 // What the stand-in server was sent: one entry per request.
 type Sent = { path: string; auth: string | null; body: unknown };
 let sent: Sent[] = [];
-// How the stand-in answers: a status, or "hang" to never answer.
-let answer: number | "hang" = 200;
+// How the stand-in answers: a status, "hang" to never answer, or a status
+// whose answer starts and never finishes.
+let answer: number | "hang" | { stalls: number } = 200;
 
 const server = Bun.serve({
   port: 0,
+  // Never closes a quiet connection itself, so only the hook can give up on one.
+  idleTimeout: 0,
   async fetch(request) {
     sent.push({
       path: new URL(request.url).pathname,
@@ -23,6 +26,14 @@ const server = Bun.serve({
       body: await request.json(),
     });
     if (answer === "hang") return new Promise<Response>(() => {});
+    if (typeof answer === "object") {
+      const begun = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"id":'));
+        },
+      });
+      return new Response(begun, { status: answer.stalls });
+    }
     return new Response(answer === 200 ? '{"id":"x"}' : '{"error":"unauthorized"}', {
       status: answer,
     });
@@ -102,11 +113,14 @@ async function run(input: string, configFolder = config): Promise<Ran> {
       SKELCREW_EVENT: "task.held",
     },
   });
+  // Stands in for Skelcrew's 30-second kill.
+  const killer = setTimeout(() => child.kill(), 30_000);
   const [code, out, err] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
   ]);
+  clearTimeout(killer);
   return { code, out, err };
 }
 
@@ -174,8 +188,13 @@ test("a held task says why, and what to do", async () => {
 });
 
 test("a task you paused yourself is told quietly", async () => {
-  await run(event("task.held", { hold: "paused by you", paused: true, waitingOnYou: "skel resume 142" }));
-  expect(sent[0]?.body).toMatchObject({ title: "shop #142 is paused", priority: 2, tags: ["pause_button"] });
+  await run(event("task.held", { hold: "you paused it", paused: true, waitingOnYou: null }));
+  expect(sent[0]?.body).toMatchObject({
+    title: "shop #142 is paused",
+    message: "Empty export crashes",
+    priority: 2,
+    tags: ["pause_button"],
+  });
 });
 
 test("a delivered task says where its result is", async () => {
@@ -313,3 +332,51 @@ test("a server that never answers is given up on after 20 seconds, within the ho
   expect(ran.err).toBe(`${SERVER} didn't answer in 20 seconds.\n`);
   expect(Date.now() - started).toBeLessThan(25_000);
 }, 30_000);
+
+// The review's findings, each a test that failed before its fix.
+
+test("a declined task keeps its reason out of the title, which ntfy limits to 1,024 bytes", async () => {
+  const reason = "This duplicates #12, which already covers empty exports. ".repeat(30).trim();
+  await run(event("task.ended", { phase: "ended", step: "ended", ended: `declined: ${reason}` }));
+  expect(sent[0]?.body).toMatchObject({
+    title: "shop #142 ended: declined",
+    message: `${reason}\n\nEmpty export crashes`,
+  });
+});
+
+test("a comment after a value in .env isn't part of the value", async () => {
+  const commented = configWith([`NTFY_SERVER=${SERVER} # at home`, "NTFY_TOPIC=skel-phone # my phone"]);
+  await run(event("task.ended", { ended: "killed" }), commented);
+  expect(sent[0]?.body).toMatchObject({ topic: "skel-phone" });
+});
+
+test("a # inside quotes is kept", async () => {
+  const quoted = configWith([`NTFY_SERVER=${SERVER}`, 'NTFY_TOPIC="skel#phone" # my phone']);
+  await run(event("task.ended", { ended: "killed" }), quoted);
+  expect(sent[0]?.body).toMatchObject({ topic: "skel#phone" });
+});
+
+test("a long message is cut between characters, never inside one", async () => {
+  await run(event("task.held", { hold: `xx${"😀".repeat(3000)}` }));
+  const body = sent[0]?.body;
+  const message = typeof body === "object" && body !== null && "message" in body ? String(body.message) : "";
+  expect(message.endsWith("…")).toBe(true);
+  expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(message)).toBe(false);
+});
+
+test("a sent push whose answer never finishes still ends the hook at once", async () => {
+  answer = { stalls: 200 };
+  const started = Date.now();
+  const ran = await run(event("task.ended", { ended: "killed" }));
+  expect(ran).toEqual({ code: 0, out: "Sent.\n", err: "" });
+  expect(Date.now() - started).toBeLessThan(5_000);
+}, 40_000);
+
+test("a refusal whose answer never finishes still names the server and its status", async () => {
+  answer = { stalls: 502 };
+  const started = Date.now();
+  const ran = await run(event("task.ended", { ended: "killed" }));
+  expect(ran.code).toBe(1);
+  expect(ran.err).toBe(`${SERVER} refused it with 502.\n`);
+  expect(Date.now() - started).toBeLessThan(25_000);
+}, 40_000);
